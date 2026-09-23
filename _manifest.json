@@ -1,0 +1,32 @@
+{
+  "manifest_version": 2,
+  "id": "org.mai-mai.reply-splitter",
+  "version": "1.0.4",
+  "name": "回复切分",
+  "description": "用规则切分替换宿主内置的 response_splitter。内置分割器只有长度与句数阈值，不理解结构，会把链接、代码块、颜文字从中间切断；本插件先算出禁止落刀的保护区（代码块 / 行内代码 / URL / @提及 / 括号对 / 颜文字），再按 段落 > 换行 > 句末标点 > 分号 > 逗号 > 空格 的优先级在长度预算内挑选切口，因此切点自然且绝不切坏结构。单段内含超长链接时宁可该段超长也不断开。首段仍走宿主原始发送链以保留引用与平台发送行为，其余段落由后台任务按顺序补发，并用重入保护避免补发内容被二次切分。配有命令回执保护窗口与 /split 运行时开关（仅管理员）。纯规则实现，不调用模型，无额外延迟与成本，任何异常都会回退为原文直发。需先把宿主 config/bot_config.toml 的 [response_splitter] enable 设为 false。",
+  "author": {
+    "name": "orge-8",
+    "url": "https://github.com/orge-8"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/orge-8/reply-splitter",
+    "issues": "https://github.com/orge-8/reply-splitter/issues"
+  },
+  "host_application": {
+    "min_version": "1.2.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.5.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN"
+  },
+  "plugin_type": "extension"
+}
