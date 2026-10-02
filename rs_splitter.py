@@ -450,6 +450,26 @@ def _absorb_short_segments(segments: list[str], min_segment_length: int) -> list
     return merged
 
 
+# 合并时不需要再补分隔符的字符：左侧已以它收尾、或右侧以它开头，说明原分隔符还在
+_NO_JOIN_NEEDED = "。！？!?…‥，,、；;：:）)]}」』 \n\t"
+
+
+def _join_separator(left: str, right: str) -> str:
+    """决定合并两个片段时插入什么分隔符。
+
+    跨强制边界合并时，原文那个位置**本就有分隔符**（换行或空格），
+    是我们打包时 strip 掉的。直接用空串连接会让两句话粘在一起
+    —— 真机实测出现「好 那再来一段今天把电台设备擦了一遍」，两句话连读。
+    这里按需补一个空格把它还原；若边界本就是标点（块内按标点切分的情况），
+    则不再补，避免产出「好了。 下一句」这种多余空格。
+    """
+    if not left or not right:
+        return ""
+    if left[-1] in _NO_JOIN_NEEDED or right[0] in _NO_JOIN_NEEDED:
+        return ""
+    return " "
+
+
 def _merge_to_limit(segments: list[str], max_segments: int) -> list[str]:
     """段数超限时，按序「均匀并入相邻段」合并到上限（O(段数)）。
 
@@ -467,7 +487,11 @@ def _merge_to_limit(segments: list[str], max_segments: int) -> list[str]:
     for group in range(max_segments):
         # 余数摊给靠前的组，保证各组段数至多差 1
         take = count // max_segments + (1 if group < count % max_segments else 0)
-        merged.append("".join(segments[cursor : cursor + take]))
+        pieces = segments[cursor : cursor + take]
+        joined = pieces[0]
+        for piece in pieces[1:]:
+            joined = joined + _join_separator(joined, piece) + piece
+        merged.append(joined)
         cursor += take
     return merged
 
