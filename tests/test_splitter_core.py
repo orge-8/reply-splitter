@@ -365,3 +365,54 @@ def test_真机回复原文切分结果锁死() -> None:
     assert segments[0].endswith("你们可以听听看"), "首段末尾变了"
     assert segments[2] == "好啦这段应该够长了 分割器工作正常吗", "尾段内容变了"
     _assert_no_content_lost(REAL_REPLY, segments)
+
+
+# ── 合并时的分隔符还原 ──────────────────────────────────────────────────────
+
+
+def test_跨强制边界合并时还原分隔符() -> None:
+    """回归（真机实测）：换行数超过 max_segments 时会发生合并。
+
+    合并若用空串连接，会让两句话直接粘连 —— 真机上出现过
+    「好 那再来一段今天把电台设备擦了一遍灰尘积了不少」。
+    原文那个位置本有换行（打包时被 strip 掉），合并时应还原为空格。
+    """
+    text = "\n".join(
+        [
+            "好 那再来一段",
+            "今天把电台设备擦了一遍灰尘积了不少",
+            "擦完之后调音台亮闪闪的看着心情都好了",
+        ]
+    )
+    rules = SplitRules(min_length=1, soft_max_length=90, max_segments=2, min_segment_length=0)
+    segments = split_reply(text, rules)
+    assert len(segments) == 2, f"应合并为 2 段: {segments}"
+    assert segments[0] == "好 那再来一段 今天把电台设备擦了一遍灰尘积了不少", (
+        f"合并处未还原分隔符: {segments[0]!r}"
+    )
+    _assert_no_content_lost(text, segments)
+
+
+def test_块内按标点合并时不补多余空格() -> None:
+    """边界本就是标点时不应补空格，否则产出「好了。 下一句」这种多余空格。"""
+    text = "这是一句话。这也是一句话。还有一句话。" * 6
+    rules = SplitRules(min_length=1, soft_max_length=20, max_segments=2, min_segment_length=0)
+    segments = split_reply(text, rules)
+    assert len(segments) == 2
+    for segment in segments:
+        assert "。 " not in segment, f"标点后出现多余空格: {segment[:40]!r}"
+    _assert_no_content_lost(text, segments)
+
+
+def test_合并后不出现两段粘死() -> None:
+    """泛化护栏：任何合并结果都不得出现「汉字紧接汉字」的粘连。"""
+    lines = [f"第{i}句内容足够长可以参与合并" for i in range(1, 16)]
+    text = "\n".join(lines)
+    segments = split_reply(
+        text, SplitRules(min_length=1, soft_max_length=60, max_segments=4, min_segment_length=0)
+    )
+    assert len(segments) == 4
+    for segment in segments:
+        # 若合并处未补分隔符，会出现「…长可以参与合并第2句…」这种无空格衔接
+        assert "合并第" not in segment, f"合并处粘死: {segment[:60]!r}"
+    _assert_no_content_lost(text, segments)
