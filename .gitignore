@@ -7,3 +7,6 @@ __pycache__/
 data/
 *.db
 *.log
+
+# 采集样本（调试期数据，含 bot 回复原文，不入库）
+/collect/

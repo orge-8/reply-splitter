@@ -20,6 +20,9 @@
 import asyncio
 import logging
 import time
+import uuid
+from dataclasses import asdict
+from pathlib import Path
 from typing import Any, ClassVar
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
@@ -30,9 +33,14 @@ from maibot_sdk.types import (
     HookOrder,
 )
 
+from .rs_collect import Collector, locate_segments
 from .rs_splitter import SplitRules, split_reply
 
-SUPPORTED_CONFIG_VERSION = "1.0.5"
+SUPPORTED_CONFIG_VERSION = "1.1.0"
+
+# 采集落盘的默认位置：插件目录下的 collect/（config.toml 同样写在这里，
+# 可写性由 Runner 验证；整目录替换部署时注意保留该子目录）
+_PLUGIN_DIR = Path(__file__).resolve().parent
 
 # 待补发登记的存活时间：超过则丢弃，避免失败发送把旧分段一直挂着
 _PENDING_TTL_SECONDS = 60.0
@@ -213,11 +221,31 @@ class AdminSectionConfig(PluginConfigBase):
     )
 
 
+class CollectSectionConfig(PluginConfigBase):
+    __ui_label__ = "采集（调试）"
+    __ui_icon__ = "download"
+    __ui_order__ = 3
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "调试期数据采集：把切分前原文、切分结果与成败事件落盘为 JSONL"
+            "（按天分文件、不自动清理），供离线分析器改进切分规则。"
+            "默认关闭；数据为 bot 自己的回复，仅落本机"
+        ),
+    )
+    dir: str = Field(
+        default="",
+        description="采集落盘目录；留空为插件目录下的 collect/ 子目录",
+    )
+
+
 class ReplySplitterConfig(PluginConfigBase):
     __ui_label__ = "回复切分"
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     splitter: SplitterSectionConfig = Field(default_factory=SplitterSectionConfig)
     admin: AdminSectionConfig = Field(default_factory=AdminSectionConfig)
+    collect: CollectSectionConfig = Field(default_factory=CollectSectionConfig)
 
 
 class ReplySplitter(MaiBotPlugin):
@@ -261,19 +289,23 @@ class ReplySplitter(MaiBotPlugin):
         self._command_grace_expiry: dict[str, float] = {}
         # 后台补发任务（强引用防 GC）
         self._tasks: set[asyncio.Task[Any]] = set()
+        # 调试期采集（旁路，默认关闭）：懒构建，目录变更时重建
+        self._collector: Collector | None = None
+        self._collector_dir: str = ""
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
 
     async def on_load(self) -> None:
         self._reset_state()
         self.ctx.logger.info(
-            "reply-splitter 已加载 enabled=%s scope=%s 规则[min=%s soft=%s hard=%s 最多%s段]",
+            "reply-splitter 已加载 enabled=%s scope=%s 规则[min=%s soft=%s hard=%s 最多%s段] 采集=%s",
             self.config.plugin.enabled,
             self.config.splitter.scope,
             self.config.splitter.min_length,
             self.config.splitter.soft_max_length,
             self.config.splitter.hard_max_length,
             self.config.splitter.max_segments,
+            "开" if self.config.collect.enabled else "关",
         )
         self.ctx.logger.info(
             "请确认宿主 config/bot_config.toml 中 [response_splitter] enable 已设为 false，"
@@ -283,10 +315,15 @@ class ReplySplitter(MaiBotPlugin):
     async def on_unload(self) -> None:
         self._cancel_tasks()
         self._reset_state()
+        self._collector = None
+        self._collector_dir = ""
         self.ctx.logger.info("reply-splitter 已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope == CONFIG_RELOAD_SCOPE_SELF:
+            # 采集目录可能在热更新里改过，弃掉旧实例，下次写入时按新配置重建
+            self._collector = None
+            self._collector_dir = ""
             self.ctx.logger.info("reply-splitter 配置已热更新 version=%s", version)
 
     # ── 状态与工具方法（必须全部排在组件区之前）────────────────────────────
@@ -372,6 +409,26 @@ class ReplySplitter(MaiBotPlugin):
 
     def _splitter_ready(self) -> bool:
         return bool(self.config.plugin.enabled) and bool(self.config.splitter.enabled) and self._runtime_enabled
+
+    # 调试期采集（旁路，默认关闭）
+
+    def _get_collector(self) -> Collector | None:
+        """懒构建采集器；返回 None 表示采集未启用。目录变更时重建。"""
+        if not self.config.collect.enabled:
+            return None
+        configured = str(self.config.collect.dir or "").strip()
+        base = configured or str(_PLUGIN_DIR / "collect")
+        if self._collector is None or base != self._collector_dir:
+            self._collector = Collector(base)
+            self._collector_dir = base
+            self.ctx.logger.info("采集已开启 dir=%s（按天分文件，不自动清理）", base)
+        return self._collector
+
+    def _collect(self, event: dict[str, Any]) -> None:
+        """写一条采集事件。采集未启用时为零开销直通。"""
+        collector = self._get_collector()
+        if collector is not None:
+            collector.write(event)
 
     # 重入保护
 
@@ -564,13 +621,15 @@ class ReplySplitter(MaiBotPlugin):
                 return True
         return False
 
-    async def _drain_pending(self, stream_id: str, segments: list[str]) -> None:
+    async def _drain_pending(self, stream_id: str, segments: list[str], rid: str = "") -> None:
         typing = bool(self.config.splitter.typing)
         self._begin_resend(stream_id)
+        cancelled = False
+        error = ""
+        failed = 0
         try:
             # 让出一次事件循环，先让宿主完成首段的发送与历史同步
             await asyncio.sleep(0)
-            failed = 0
             for segment in segments:
                 if not await self._send_one(segment, stream_id, typing):
                     failed += 1
@@ -581,12 +640,21 @@ class ReplySplitter(MaiBotPlugin):
             else:
                 self.ctx.logger.info("补发分段完成 stream=%s 共 %s 段", stream_id, len(segments))
         except asyncio.CancelledError:
+            cancelled = True
             self.ctx.logger.warning("补发任务被取消 stream=%s", stream_id)
             raise
         except Exception as exc:  # noqa: BLE001
+            error = str(exc)[:200]
             self.ctx.logger.error("补发任务异常 stream=%s: %s", stream_id, exc)
         finally:
             self._end_resend(stream_id)
+            event: dict[str, Any] = {
+                "event": "resend", "rid": rid, "stream": stream_id,
+                "total": len(segments), "failed": failed, "cancelled": cancelled,
+            }
+            if error:
+                event["error"] = error
+            self._collect(event)
 
     def _has_pending_work(self, stream_id: str) -> bool:
         return bool(self._pending.get(stream_id)) or self._is_resending(stream_id)
@@ -669,8 +737,10 @@ class ReplySplitter(MaiBotPlugin):
         if not stream_id:
             return {"action": "continue"}
         if self._is_resending(stream_id):
+            self._collect({"event": "skip", "stream": stream_id, "reason": "resending"})
             return {"action": "continue"}
         if self._in_command_protection(stream_id):
+            self._collect({"event": "skip", "stream": stream_id, "reason": "command_protection"})
             return {"action": "continue"}
         if stream_id in self._pending:
             # 上一条回复的分段还没补发完。此刻覆盖登记会把旧分段静默丢掉，
@@ -678,6 +748,7 @@ class ReplySplitter(MaiBotPlugin):
             self.ctx.logger.warning(
                 "该聊天流已有待补发分段，本次跳过切分以免覆盖 stream=%s", stream_id
             )
+            self._collect({"event": "skip", "stream": stream_id, "reason": "pending_exists"})
             return {"action": "continue"}
 
         # 具名形参不会出现在 **kwargs 里，必须显式并回载荷，
@@ -708,18 +779,30 @@ class ReplySplitter(MaiBotPlugin):
         if scope != "all" and not self._is_armed(stream_id):
             if not self._replyer_hook_seen:
                 self._warn_missing_replyer_hook()
+            self._collect({"event": "skip", "stream": stream_id, "reason": "not_armed"})
             return {"action": "continue"}
 
         text = self._locate_text(payload, message)
         if not text:
+            self._collect({"event": "skip", "stream": stream_id, "reason": "no_text"})
             return {"action": "continue"}
 
+        rid = uuid.uuid4().hex[:12]
+        rules = self._build_rules()
         try:
-            segments = split_reply(text, self._build_rules())
+            segments = split_reply(text, rules)
         except Exception as exc:  # noqa: BLE001 - 切分失败必须原样放行
             self.ctx.logger.error("切分异常，原样放行 stream=%s: %s", stream_id, exc)
+            self._collect(
+                {"event": "exception", "rid": rid, "stream": stream_id,
+                 "text": text, "rules": asdict(rules), "error": str(exc)[:200]}
+            )
             return {"action": "continue"}
         if len(segments) <= 1:
+            self._collect(
+                {"event": "no_split", "rid": rid, "stream": stream_id,
+                 "text": text, "segments": segments, "rules": asdict(rules)}
+            )
             return {"action": "continue"}
 
         modified, message_changed = self._apply_replacement(payload, message, text, segments[0])
@@ -728,6 +811,11 @@ class ReplySplitter(MaiBotPlugin):
                 "未能在出站载荷里定位正文，放弃切分 stream=%s keys=%s",
                 stream_id,
                 sorted(kwargs.keys())[:12],
+            )
+            self._collect(
+                {"event": "aborted", "rid": rid, "stream": stream_id, "reason": "no_payload_match",
+                 "text": text, "segments": segments,
+                 "located": locate_segments(text, segments), "rules": asdict(rules)}
             )
             return {"action": "continue"}
         if not message_changed:
@@ -738,7 +826,15 @@ class ReplySplitter(MaiBotPlugin):
                 type(message).__name__,
             )
 
+        self._collect(
+            {"event": "split", "rid": rid, "stream": stream_id,
+             "text": text, "segments": segments,
+             "located": locate_segments(text, segments),
+             "rules": asdict(rules), "inplace_ok": message_changed}
+        )
+
         self._pending[stream_id] = {
+            "rid": rid,
             "segments": segments[1:],
             # 校验依据：after_send 用它判断宿主实发的到底是首段还是全文
             "expected_first": segments[0],
@@ -775,10 +871,12 @@ class ReplySplitter(MaiBotPlugin):
         entry = self._pending.pop(stream_id, None)
         if not entry:
             return
+        rid = str(entry.get("rid") or "")
         if float(entry.get("expires_at", 0.0)) <= time.monotonic():
             # 清理只在有出站消息时才跑，所以这里必须自己再判一次：
             # 迟到的 after_send 不能把早已过期的分段补发出去。
             self.ctx.logger.warning("待补发登记已过期，放弃补发 stream=%s", stream_id)
+            self._collect({"event": "expire", "rid": rid, "stream": stream_id})
             return
         segments = list(entry.get("segments") or [])
         if not segments:
@@ -800,9 +898,13 @@ class ReplySplitter(MaiBotPlugin):
                 len(sample),
                 sample[:60],
             )
+            self._collect(
+                {"event": "verify", "rid": rid, "stream": stream_id,
+                 "verdict": verdict, "sample_len": len(sample)}
+            )
             return
 
-        task = asyncio.create_task(self._drain_pending(stream_id, segments))
+        task = asyncio.create_task(self._drain_pending(stream_id, segments, rid))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
