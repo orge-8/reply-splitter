@@ -255,20 +255,80 @@ def test_skip_event_recorded(tmp_path):
         await plugin.on_load()
         stream = "s-skip"
         plugin._begin_resend(stream)
+        echo_text = "补发中的分段文本"
+        plugin._mark_sending_text(stream, plugin._normalize_for_compare(echo_text))
         try:
             await plugin.split_outgoing_message(
-                message={"session_id": stream, "processed_plain_text": LONG_TEXT},
-                processed_plain_text=LONG_TEXT,
+                message={"session_id": stream, "processed_plain_text": echo_text},
+                processed_plain_text=echo_text,
                 stream_id=stream,
             )
         finally:
+            plugin._unmark_sending_text(stream, plugin._normalize_for_compare(echo_text))
             plugin._end_resend(stream)
         await plugin.on_unload()
 
     asyncio.run(run())
     events = _read_events(collect_dir)
     skips = [event for event in events if event["event"] == "skip"]
-    assert skips and skips[0]["reason"] == "resending"
+    assert skips and skips[0]["reason"] == "resend_echo"
+
+
+def test_new_reply_during_resend_still_splits(tmp_path):
+    """文本级重入判据（v1.2.0）：补发期间同会话另一轮回复照常切分，
+    只有回环补发文本被拦。"""
+    collect_dir = tmp_path / "collect"
+    module, plugin, _host = _build_plugin(collect_dir=collect_dir)
+
+    async def run():
+        await plugin.on_load()
+        stream = "s-concurrent"
+        echo_text = "补发中的分段文本"
+        plugin._begin_resend(stream)
+        plugin._mark_sending_text(stream, plugin._normalize_for_compare(echo_text))
+        try:
+            # 回环文本 → 拦
+            echo_result = await plugin.split_outgoing_message(
+                message={"session_id": stream, "processed_plain_text": echo_text},
+                processed_plain_text=echo_text,
+                stream_id=stream,
+            )
+            assert "modified_kwargs" not in echo_result
+            # 新一轮回复 → 照常切分
+            await plugin.arm_replyer_reply(session_id=stream)
+            fresh = await plugin.split_outgoing_message(
+                message={"session_id": stream, "processed_plain_text": LONG_TEXT},
+                processed_plain_text=LONG_TEXT,
+                stream_id=stream,
+            )
+            assert "modified_kwargs" in fresh, "并发轮次被会话级一票否决误拦"
+        finally:
+            plugin._unmark_sending_text(stream, plugin._normalize_for_compare(echo_text))
+            plugin._end_resend(stream)
+        plugin._pending.pop(stream, None)
+        await plugin.on_unload()
+
+    asyncio.run(run())
+    events = _read_events(collect_dir)
+    kinds = [event["event"] for event in events]
+    assert "split" in kinds
+    skips = [event for event in events if event["event"] == "skip"]
+    assert skips and skips[0]["reason"] == "resend_echo"
+
+
+def test_planner_wait_hook_releases_without_pending(tmp_path):
+    """planner 等待钩子：无待补发时立即放行。"""
+    module, plugin, _host = _build_plugin(collect_dir=None)
+
+    async def run():
+        await plugin.on_load()
+        result = await plugin.wait_for_pending_segments_planner(
+            session_id="s-planner", stream_id="s-planner"
+        )
+        assert result.get("action") == "continue"
+        await plugin.on_unload()
+
+    asyncio.run(run())
 
 
 def test_no_split_event_recorded(tmp_path):

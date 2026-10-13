@@ -7,7 +7,8 @@
   2. 在 `send_service.after_build_message` 阶段按规则切分，
      首段仍走宿主原始发送链（保留引用与平台发送行为），其余段落登记待补发
   3. 在 `send_service.after_send` 阶段起后台任务，按顺序补发剩余段落
-  4. 用重入保护避免补发内容被二次切分
+  4. 用文本级重入保护避免补发内容被二次切分（只拦自己补发分段的回环出站，
+     同会话另一轮回复照常切分）
 
 所有切分逻辑在 rs_splitter 模块里，是不依赖 ctx 的纯函数，可脱机单测。
 
@@ -36,7 +37,7 @@ from maibot_sdk.types import (
 from .rs_collect import Collector, locate_segments
 from .rs_splitter import SplitRules, split_reply
 
-SUPPORTED_CONFIG_VERSION = "1.1.0"
+SUPPORTED_CONFIG_VERSION = "1.2.0"
 
 # 采集落盘的默认位置：插件目录下的 collect/（config.toml 同样写在这里，
 # 可写性由 Runner 验证；整目录替换部署时注意保留该子目录）
@@ -274,8 +275,12 @@ class ReplySplitter(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._runtime_enabled: bool = True
-        # 重入保护：正在补发内容的聊天流，其出站消息不再被切分
+        # 重入保护（计数器）：等待补发完成的时序守卫仍以它为准；
+        # 切分准入的判据已细化为「文本级」，见 _resending_texts
         self._resend_guards: dict[str, int] = {}
+        # 文本级重入判据：stream_id -> 正在补发的分段正文（规范化键）。
+        # 只拦「自己补发分段的回环出站」，同会话另一轮回复照常切分
+        self._resending_texts: dict[str, set[str]] = {}
         # 待补发：stream_id -> {"segments": [...], "expires_at": float}
         self._pending: dict[str, dict[str, Any]] = {}
         # 「本条出站源自回复模型」标记：stream_id -> 过期时间
@@ -330,6 +335,7 @@ class ReplySplitter(MaiBotPlugin):
 
     def _reset_state(self) -> None:
         self._resend_guards.clear()
+        self._resending_texts.clear()
         self._pending.clear()
         self._armed.clear()
         self._command_active.clear()
@@ -444,6 +450,25 @@ class ReplySplitter(MaiBotPlugin):
             self._resend_guards[stream_id] = remaining
         else:
             self._resend_guards.pop(stream_id, None)
+
+    # 文本级重入判据（借鉴 cateye_better_post-processing 的思路，独立实现）：
+    # 会话级「补发中一票否决」会让补发窗口内同会话另一轮回复被整条放弃切分；
+    # 改为只拦「自己正在补发的分段正文」的回环出站，并发轮次照常切分。
+
+    def _mark_sending_text(self, stream_id: str, text_key: str) -> None:
+        if stream_id and text_key:
+            self._resending_texts.setdefault(stream_id, set()).add(text_key)
+
+    def _unmark_sending_text(self, stream_id: str, text_key: str) -> None:
+        bucket = self._resending_texts.get(stream_id)
+        if bucket is not None:
+            bucket.discard(text_key)
+            if not bucket:
+                self._resending_texts.pop(stream_id, None)
+
+    def _is_own_resend_text(self, stream_id: str, text: str) -> bool:
+        text_key = self._normalize_for_compare(text)
+        return bool(text_key) and text_key in self._resending_texts.get(stream_id, ())
 
     # 命令回执保护
 
@@ -600,26 +625,33 @@ class ReplySplitter(MaiBotPlugin):
         return bool(result)
 
     async def _send_one(self, segment: str, stream_id: str, typing: bool) -> bool:
-        for attempt in range(_SEND_MAX_ATTEMPTS):
-            try:
-                result = await self.ctx.send.text(
-                    segment,
-                    stream_id,
-                    return_details=False,
-                    typing=typing and attempt == 0,
-                    sync_to_maisaka_history=True,
-                    timeout_ms=_SEND_RPC_TIMEOUT_MS,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - 单段失败不应中断后续分段
-                self.ctx.logger.warning(
-                    "补发分段失败（第 %s 次）stream=%s: %s", attempt + 1, stream_id, exc
-                )
-                result = False
-            if self._send_succeeded(result):
-                return True
-        return False
+        # 登记本段正文：发送链路回环经过 after_build_message 时，
+        # 文本级重入判据凭它识别「这是自己补发的分段」
+        text_key = self._normalize_for_compare(segment)
+        self._mark_sending_text(stream_id, text_key)
+        try:
+            for attempt in range(_SEND_MAX_ATTEMPTS):
+                try:
+                    result = await self.ctx.send.text(
+                        segment,
+                        stream_id,
+                        return_details=False,
+                        typing=typing and attempt == 0,
+                        sync_to_maisaka_history=True,
+                        timeout_ms=_SEND_RPC_TIMEOUT_MS,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 单段失败不应中断后续分段
+                    self.ctx.logger.warning(
+                        "补发分段失败（第 %s 次）stream=%s: %s", attempt + 1, stream_id, exc
+                    )
+                    result = False
+                if self._send_succeeded(result):
+                    return True
+            return False
+        finally:
+            self._unmark_sending_text(stream_id, text_key)
 
     async def _drain_pending(self, stream_id: str, segments: list[str], rid: str = "") -> None:
         typing = bool(self.config.splitter.typing)
@@ -737,8 +769,17 @@ class ReplySplitter(MaiBotPlugin):
         if not stream_id:
             return {"action": "continue"}
         if self._is_resending(stream_id):
-            self._collect({"event": "skip", "stream": stream_id, "reason": "resending"})
-            return {"action": "continue"}
+            # 文本级重入判据：只拦「自己正在补发的分段」的回环出站；
+            # 同会话另一轮回复（文本对不上）照常切分。
+            # 具名形参不在 kwargs 里，探测正文要先把它们并入候选。
+            probe = (
+                (processed_plain_text if isinstance(processed_plain_text, str) else "")
+                or (display_message if isinstance(display_message, str) else "")
+                or self._locate_text(kwargs, message)
+            )
+            if not probe or self._is_own_resend_text(stream_id, probe):
+                self._collect({"event": "skip", "stream": stream_id, "reason": "resend_echo"})
+                return {"action": "continue"}
         if self._in_command_protection(stream_id):
             self._collect({"event": "skip", "stream": stream_id, "reason": "command_protection"})
             return {"action": "continue"}
@@ -933,6 +974,28 @@ class ReplySplitter(MaiBotPlugin):
     async def wait_for_pending_segments(
         self, message: dict[str, Any] | None = None, **kwargs: Any
     ) -> dict[str, Any]:
+        if not self._splitter_ready():
+            return {"action": "continue"}
+        stream_id = self._resolve_stream_id(kwargs, message)
+        if stream_id:
+            await self._wait_pending(stream_id, int(self.config.splitter.wait_for_pending_ms))
+        return {"action": "continue"}
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="wait_for_pending_segments_planner",
+        description="下一轮 planner 请求前先等同一聊天流的补发结束，避免回复上下文缺后半段",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        timeout_ms=12000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def wait_for_pending_segments_planner(
+        self, message: dict[str, Any] | None = None, **kwargs: Any
+    ) -> dict[str, Any]:
+        """借鉴 cateye_better_post-processing 的时序守卫思路（独立实现）：
+        入站等待只保证「新消息不插到旧分段中间」，但下一轮 planner 拉起时
+        补发若还没跑完，模型看到的对话历史就缺后半段——这里再等一次。"""
         if not self._splitter_ready():
             return {"action": "continue"}
         stream_id = self._resolve_stream_id(kwargs, message)

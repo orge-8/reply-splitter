@@ -25,6 +25,7 @@ EXPECTED_COMPONENTS = {
     "dispatch_pending_segments": "dispatch_pending_segments",
     "arm_replyer_reply": "arm_replyer_reply",
     "wait_for_pending_segments": "wait_for_pending_segments",
+    "wait_for_pending_segments_planner": "wait_for_pending_segments_planner",
     "mark_command_active": "mark_command_active",
     "mark_command_inactive": "mark_command_inactive",
 }
@@ -168,18 +169,29 @@ def main() -> int:
         assert "typing" in send_args, "补发未透传 typing 参数"
         assert stream not in plugin._pending, "待补发登记未清理"
 
-        # ── 4. 重入保护：补发期间同一聊天流的出站消息不得被再次切分
+        # ── 4. 重入保护（文本级）：自己补发分段的回环出站不得被二次切分；
+        #      同会话另一轮回复（文本对不上）照常切分
+        echo_text = "补发中的分段文本"
         await plugin.arm_replyer_reply(session_id=stream)
         plugin._begin_resend(stream)
+        plugin._mark_sending_text(stream, plugin._normalize_for_compare(echo_text))
         try:
             again = await plugin.split_outgoing_message(
+                message={"session_id": stream, "processed_plain_text": echo_text},
+                processed_plain_text=echo_text,
+                stream_id=stream,
+            )
+            assert "modified_kwargs" not in again, "回环补发文本被二次切分"
+            fresh = await plugin.split_outgoing_message(
                 message={"session_id": stream, "processed_plain_text": LONG_TEXT},
                 processed_plain_text=LONG_TEXT,
                 stream_id=stream,
             )
-            assert "modified_kwargs" not in again, "重入保护失效，补发内容会被二次切分"
+            assert "modified_kwargs" in fresh, "补发期间同会话新一轮回复未被切分（会话级一票否决复发）"
         finally:
+            plugin._unmark_sending_text(stream, plugin._normalize_for_compare(echo_text))
             plugin._end_resend(stream)
+        plugin._pending.pop(stream, None)
 
         # ── 5. 命令回执保护窗口内的回复不切分
         cmd_stream = "s-command"
