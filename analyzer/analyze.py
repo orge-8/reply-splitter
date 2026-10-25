@@ -52,6 +52,7 @@ _SKIP_LABELS = {
     "pending_exists": "上条分段未补发完",
     "not_armed": "未标记回复来源",
     "no_text": "载荷无正文",
+    "raw_output": "正文含控制标签（整条直发）",
 }
 
 _HEURISTIC_CAP = 40  # 举牌清单最多渲染多少条，防止报告失控

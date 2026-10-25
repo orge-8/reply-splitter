@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
+from collections import Counter
 
 import pytest
 
@@ -94,7 +95,18 @@ def _normalized(text: str) -> str:
 
 
 def _assert_no_content_lost(original: str, segments: list[str]) -> None:
-    assert _normalized("".join(segments)) == _normalized(original), "切分过程丢字或加字了"
+    joined = _normalized("".join(segments))
+    source = _normalized(original)
+    if joined == source:
+        return
+    # 切口落在逗号后时，该段尾逗号会被删掉。只允许这一种差异：
+    # 缺的字必须全是逗号类标点、数量不超过切点数，且剩下的字序不变。
+    missing = Counter(source) - Counter(joined)
+    assert not (Counter(joined) - Counter(source)), "切分过程加字了"
+    assert set(missing) <= set("，,、"), f"切分过程丢了非标点内容: {dict(missing)}"
+    assert sum(missing.values()) <= max(0, len(segments) - 1), "删掉的标点数超过切点数"
+    iterator = iter(source)
+    assert all(ch in iterator for ch in joined), "切分过程改了字序"
 
 
 def _assert_atoms_intact(original: str, segments: list[str], rules: SplitRules) -> None:
@@ -120,6 +132,36 @@ def test_corpus_invariants(name: str) -> None:
     _assert_no_content_lost(text, segments)
     _assert_atoms_intact(text, segments, RULES)
     _assert_well_formed(segments, RULES)
+
+
+def test_切点尾逗号被移除() -> None:
+    rules = SplitRules(min_length=10, soft_max_length=20)
+    text = (
+        "这是一段很长的文本用来验证尾逗号会被删掉，"
+        "后面的内容继续延伸直到超过长度预算为止，还要再补一些字让它够长。"
+    )
+    segments = split_reply(text, rules)
+    assert len(segments) > 1
+    for segment in segments[:-1]:
+        assert not segment.endswith(("，", ",", "、")), f"非末段仍以逗号收尾: {segment!r}"
+    _assert_no_content_lost(text, segments)
+
+
+def test_末段逗号保持不变() -> None:
+    rules = SplitRules(min_length=10, soft_max_length=20)
+    text = "这是一段很长的文本用来验证末段逗号保留，然后后面还有更多内容，最后以逗号结尾，"
+    segments = split_reply(text, rules)
+    assert len(segments) > 1
+    assert segments[-1].endswith("，"), "末段是模型自己的标点，不应被删"
+
+
+def test_短段并回时保留逗号() -> None:
+    """删逗号必须在合并短段之后做，否则并回时会把两句话粘成一句。"""
+    rules = SplitRules(min_length=10, soft_max_length=20, min_segment_length=10)
+    text = "第一段内容很长很长很长很长很长，短句，后面还有很长很长很长很长很长的第三段内容。"
+    segments = split_reply(text, rules)
+    assert len(segments) >= 2
+    assert "，短句" in segments[0], f"短段并回时丢了分隔逗号: {segments[0]!r}"
 
 
 def test_short_text_not_split() -> None:

@@ -20,6 +20,7 @@
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from dataclasses import asdict
@@ -67,6 +68,11 @@ MIN_SOFT_MAX_LENGTH = 8
 
 # 出站消息正文可能出现的字段名（按可信度排序）
 _TEXT_KEYS = ("processed_plain_text", "display_message", "raw_message", "content", "text")
+
+# 控制标签：模型把推理块（<think> / <mm:think>）或系统标记写进正文时，
+# 绝不能再按长度切开——那会把内部推理拆成多条消息发出去。
+# 只认字母开头的标签，避开 `<3` 和 `<(...)>` 这类颜文字。
+_CONTROL_TAG_RE = re.compile(r"</?[A-Za-z][^>\n]{0,40}>")
 
 
 def _replace_in_place(node: Any, original: str, replacement: str, depth: int = 0) -> bool:
@@ -533,16 +539,21 @@ class ReplySplitter(MaiBotPlugin):
 
     @classmethod
     def _locate_text(cls, kwargs: dict[str, Any], message: Any) -> str:
+        return cls._locate_text_with_src(kwargs, message)[0]
+
+    @classmethod
+    def _locate_text_with_src(cls, kwargs: dict[str, Any], message: Any) -> tuple[str, str]:
+        """返回 (正文, 命中的字段名)。字段名用于采集，定位根因时能直接看到取自哪一层。"""
         for key in _TEXT_KEYS:
             value = kwargs.get(key)
             if isinstance(value, str) and value.strip():
-                return value
+                return value, key
         if isinstance(message, dict):
             for key in _TEXT_KEYS:
                 value = message.get(key)
                 if isinstance(value, str) and value.strip():
-                    return value
-        return ""
+                    return value, key
+        return "", ""
 
     @classmethod
     def _apply_replacement(
@@ -823,9 +834,21 @@ class ReplySplitter(MaiBotPlugin):
             self._collect({"event": "skip", "stream": stream_id, "reason": "not_armed"})
             return {"action": "continue"}
 
-        text = self._locate_text(payload, message)
+        text, src = self._locate_text_with_src(payload, message)
         if not text:
             self._collect({"event": "skip", "stream": stream_id, "reason": "no_text"})
+            return {"action": "continue"}
+        if _CONTROL_TAG_RE.search(text):
+            # 整条直发：切开只会把推理块拆成更多条消息，扩大泄漏面。
+            # 根因（谁没剥掉标签）在插件上游，这里只做兜底，不替上游清洗正文。
+            self.ctx.logger.warning(
+                "正文含控制标签，跳过切分 stream=%s src=%s 正文=%r",
+                stream_id, src, text[:60],
+            )
+            self._collect(
+                {"event": "skip", "stream": stream_id, "reason": "raw_output",
+                 "src": src, "text": text[:200]}
+            )
             return {"action": "continue"}
 
         rid = uuid.uuid4().hex[:12]
@@ -835,13 +858,13 @@ class ReplySplitter(MaiBotPlugin):
         except Exception as exc:  # noqa: BLE001 - 切分失败必须原样放行
             self.ctx.logger.error("切分异常，原样放行 stream=%s: %s", stream_id, exc)
             self._collect(
-                {"event": "exception", "rid": rid, "stream": stream_id,
+                {"event": "exception", "rid": rid, "stream": stream_id, "src": src,
                  "text": text, "rules": asdict(rules), "error": str(exc)[:200]}
             )
             return {"action": "continue"}
         if len(segments) <= 1:
             self._collect(
-                {"event": "no_split", "rid": rid, "stream": stream_id,
+                {"event": "no_split", "rid": rid, "stream": stream_id, "src": src,
                  "text": text, "segments": segments, "rules": asdict(rules)}
             )
             return {"action": "continue"}
@@ -855,7 +878,7 @@ class ReplySplitter(MaiBotPlugin):
             )
             self._collect(
                 {"event": "aborted", "rid": rid, "stream": stream_id, "reason": "no_payload_match",
-                 "text": text, "segments": segments,
+                 "src": src, "text": text, "segments": segments,
                  "located": locate_segments(text, segments), "rules": asdict(rules)}
             )
             return {"action": "continue"}
@@ -868,7 +891,7 @@ class ReplySplitter(MaiBotPlugin):
             )
 
         self._collect(
-            {"event": "split", "rid": rid, "stream": stream_id,
+            {"event": "split", "rid": rid, "stream": stream_id, "src": src,
              "text": text, "segments": segments,
              "located": locate_segments(text, segments),
              "rules": asdict(rules), "inplace_ok": message_changed}

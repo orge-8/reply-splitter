@@ -225,6 +225,29 @@ def main() -> int:
         )
         assert "modified_kwargs" not in ghost, "无法回填正文时不应切分"
 
+        # ── 7b. 正文含控制标签时整条直发，绝不把推理块拆开发送
+        raw_stream = "s-raw-output"
+        await plugin.arm_replyer_reply(session_id=raw_stream)
+        raw_text = (
+            "00:08 深夜，梦回越战又来要晚安吻了，这是之前互动的延续——她有排第一的特权，"
+            "我之前傲娇地给过她晚安吻。这次她又在睡前撒娇，我应该傲娇地兑现，然后催她睡觉。"
+            "简短一句，不引用消息，不模仿插件格式。</mm:think>嗯～～～只给你一个，快闭眼睡吧。"
+        )
+        raw_result = await plugin.split_outgoing_message(
+            message={"session_id": raw_stream, "processed_plain_text": raw_text},
+            processed_plain_text=raw_text,
+            stream_id=raw_stream,
+        )
+        assert "modified_kwargs" not in raw_result, "控制标签正文被切分发送"
+        assert raw_stream not in plugin._pending, "控制标签正文仍登记了待补发"
+        assert module._CONTROL_TAG_RE.search("给你一个<3 和一个<(￣︶￣)>") is None, "颜文字被误判成控制标签"
+
+        # 采集用的字段来源：split/no_split 事件靠它定位正文取自哪一层
+        located_text, located_src = plugin._locate_text_with_src(
+            {"processed_plain_text": "正文"}, {}
+        )
+        assert (located_text, located_src) == ("正文", "processed_plain_text")
+
         # ── 8. 管理命令
         ok, resp, intercept = await plugin.cmd_split(
             text="/split status", stream_id="s-cmd", matched_groups={"action": "status"}

@@ -28,6 +28,9 @@ SENTENCE_ENDERS = "。！？!?…‥."
 SOFT_ENDERS = "；;：:~～"
 # 再次：顿号 / 逗号
 COMMA_ENDERS = "，,、"
+# 切点落在逗号后时，段尾会留下一个「，」；一条消息以逗号收尾看起来像没说完。
+# 删掉它不影响语义，但必须在所有合并之后做 —— 短段并回是直接拼接，逗号就是分隔符。
+_CUT_TRAILING_COMMAS = "，,、"
 # 收尾符：跟在句末标点后，切点应落到它后面而不是前面
 CLOSERS = "」』】）》〉”’\"'）)]}"
 
@@ -454,6 +457,19 @@ def _absorb_short_segments(segments: list[str], min_segment_length: int) -> list
 _NO_JOIN_NEEDED = "。！？!?…‥，,、；;：:）)]}」』 \n\t"
 
 
+def _strip_cut_trailing_commas(segments: list[str]) -> list[str]:
+    """去掉非末段切口处的尾逗号，末段保留模型自己的标点。
+
+    语义上后半句紧接着下一段，逗号留着反而像「话没说完」。
+    必须在 _absorb_short_segments / _merge_to_limit 之后调用：那两步是直接拼接，
+    段尾逗号是唯一的分隔符，先删会把两句话粘成一句。
+    """
+    if len(segments) <= 1:
+        return segments
+    cleaned = [segment.rstrip(_CUT_TRAILING_COMMAS) or segment for segment in segments[:-1]]
+    return cleaned + [segments[-1]]
+
+
 def _join_separator(left: str, right: str) -> str:
     """决定合并两个片段时插入什么分隔符。
 
@@ -561,4 +577,6 @@ def split_reply(text: str, rules: SplitRules) -> list[str]:
     if len(segments) > max_segments:
         segments = _merge_to_limit(segments, max_segments)
 
-    return segments or [stripped]
+    if not segments:
+        return [stripped]
+    return _strip_cut_trailing_commas(segments)
