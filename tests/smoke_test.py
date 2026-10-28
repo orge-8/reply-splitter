@@ -328,6 +328,80 @@ def main() -> int:
         assert classify("", first, full) == "unknown", "空文本应返回 unknown"
         assert classify("abcdefghij", first, full) == "failed", "实发比全文还长应判 failed"
 
+        # ── 11b. 实发校验的聚合口径（v1.2.2 保守化；真机 2026-10-26 刷屏回归）
+        # 现场：hybrid 出站载荷同时含「被就地改写的首段」与「未改写的全文」，
+        # 宿主按全文发出，旧实现先命中首段就判 ok → 放行补发 → 内容讲两遍。
+        verify = plugin._verify_sent
+        verdict, _ = verify(
+            {"session_id": "s", "segments": [{"content": full}]},
+            {"processed_plain_text": first},
+            first,
+            full,
+        )
+        assert verdict == "failed", f"全文与首段并存时必须判 failed，实际 {verdict}"
+
+        # 无关超长串不得把结论拉成 failed，否则切分永久失效
+        verdict, _ = verify(
+            {"session_id": "s", "processed_plain_text": first},
+            {"prompt": "x" * (len(full) + 50)},
+            first,
+            full,
+        )
+        assert verdict == "ok", f"无关长串不应导致 failed，实际 {verdict}"
+
+        verdict, _ = verify({"processed_plain_text": first}, {}, first, full)
+        assert verdict == "ok", f"只有首段应判 ok，实际 {verdict}"
+
+        # ── 11c. 钩子载荷诊断（v1.2.3）：任何形状的实参都不得抛出
+        plugin._log_hook_payload("t-empty", {})
+        plugin._log_hook_payload(
+            "t-mixed",
+            {
+                "session_id": "s",
+                "response": "短正文",
+                "nested": {"a": 1, "b": "x"},
+                "count": 3,
+                "blob": "y" * 500,
+                "items": [1, 2, 3],
+            },
+        )
+
+        # ── 11d. arm 带正文时的来源判定（v1.2.4；真机 2026-10-26 推送被切刷屏）
+        matches = plugin._text_matches_reply
+        assert matches("甲乙丙", "甲乙丙") is True, "完全相同应视为同一条"
+        assert matches("甲乙丙", "甲乙丙丁") is True, "互为前缀应视为同一条"
+        assert matches("完全是别的内容", "甲乙丙") is False, "不同正文必须判否"
+        assert matches("", "甲乙丙") is False, "空出站必须判否"
+        assert matches("甲乙丙", "") is False, "无期望正文必须判否"
+
+        # 推送误入 arm 窗口：正文与回复不符 → 不得切分、不得登记补发
+        push_stream = "s-push-mismatch"
+        await plugin.arm_replyer_reply(
+            session_id=push_stream,
+            response="这才是回复模型产出的正文，它足够长所以正常应该被切成多段。",
+        )
+        push_text = "📢 某UP主 发布了新动态 " + "一条动态的正文内容" * 30
+        push_result = await plugin.split_outgoing_message(
+            message={"session_id": push_stream},
+            processed_plain_text=push_text,
+            stream_id=push_stream,
+        )
+        assert "modified_kwargs" not in push_result, "推送正文不应被改写"
+        assert push_stream not in plugin._pending, "推送不应登记待补发"
+
+        # 同一窗口内真正的回复仍要正常切分（不能把功能一起关掉）
+        # 长度要超过 soft_max_length(180)，否则连正常回复也不会被切
+        reply_stream = "s-reply-match"
+        reply_text = "这是一句需要被切开的回复内容，" * 20
+        await plugin.arm_replyer_reply(session_id=reply_stream, response=reply_text)
+        reply_result = await plugin.split_outgoing_message(
+            message={"session_id": reply_stream},
+            processed_plain_text=reply_text,
+            stream_id=reply_stream,
+        )
+        assert "modified_kwargs" in reply_result, "与回复正文一致的出站必须仍被切分"
+        assert reply_stream in plugin._pending, "正常回复应已登记待补发"
+
         await plugin.on_unload()
         assert not plugin._tasks and not plugin._pending, "卸载后仍有残留任务或登记"
 

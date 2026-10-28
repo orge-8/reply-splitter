@@ -291,6 +291,11 @@ class ReplySplitter(MaiBotPlugin):
         self._pending: dict[str, dict[str, Any]] = {}
         # 「本条出站源自回复模型」标记：stream_id -> 过期时间
         self._armed: dict[str, float] = {}
+        # arm 时记下 replyer 产出的回复正文（归一化）：stream_id -> 正文。
+        # v1.2.4：仅凭「时间窗」无法区分「回复」与「插件推送」——真机 2026-10-26
+        # 一条 B 站动态推送恰好落在 120s 窗口内，被切成 10 段刷屏。有正文比对后，
+        # 出站内容与 replyer 刚产出的正文不符即判定为非回复，跳过切分。
+        self._armed_text: dict[str, str] = {}
         # 是否观测到过 replyer 钩子（用于区分「钩子不存在」与「bot 还没回过话」）
         self._replyer_hook_seen: bool = False
         self._arm_warning_emitted: bool = False
@@ -344,6 +349,7 @@ class ReplySplitter(MaiBotPlugin):
         self._resending_texts.clear()
         self._pending.clear()
         self._armed.clear()
+        self._armed_text.clear()
         self._command_active.clear()
         self._command_active_expiry.clear()
         self._command_grace_expiry.clear()
@@ -512,12 +518,25 @@ class ReplySplitter(MaiBotPlugin):
         for stream_id, expiry in list(self._armed.items()):
             if expiry <= now:
                 self._armed.pop(stream_id, None)
+                self._armed_text.pop(stream_id, None)
 
     # 回复来源标记
 
-    def _arm_stream(self, stream_id: str) -> None:
-        if stream_id:
-            self._armed[stream_id] = time.monotonic() + _ARM_TTL_SECONDS
+    def _arm_stream(self, stream_id: str, expected_text: str = "") -> None:
+        """标记该聊天流接下来有一条回复模型产出的回复。
+
+        ``expected_text`` 是该回复的正文（来自 `after_response.response`）。
+        带上它才能把「回复」与「同窗口内其他插件的出站」区分开；留空则退化为
+        旧版纯时间窗判定（仅供无法拿到正文的 Host 版本使用）。
+        """
+        if not stream_id:
+            return
+        self._armed[stream_id] = time.monotonic() + _ARM_TTL_SECONDS
+        normalized = self._normalize_for_compare(expected_text)
+        if normalized:
+            self._armed_text[stream_id] = normalized
+        else:
+            self._armed_text.pop(stream_id, None)
 
     def _is_armed(self, stream_id: str) -> bool:
         expiry = self._armed.get(stream_id, 0.0)
@@ -525,6 +544,24 @@ class ReplySplitter(MaiBotPlugin):
 
     def _consume_arm(self, stream_id: str) -> None:
         self._armed.pop(stream_id, None)
+        self._armed_text.pop(stream_id, None)
+
+    @classmethod
+    def _text_matches_reply(cls, sent: str, expected: str) -> bool:
+        """出站正文是否就是 replyer 刚产出的那条回复。
+
+        宿主可能在 replyer 之后对正文做后处理（表达方式注入、错别字修正、
+        @ 提及归一），因此不要求逐字相等：归一化后相等、或互为前缀即视为同一条。
+        真机 2026-10-28 实测 `after_response.response` 与出站
+        `processed_plain_text` 同为 250 字、内容一致，前缀判定足以覆盖。
+        """
+        a = cls._normalize_for_compare(sent)
+        b = cls._normalize_for_compare(expected)
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        return a.startswith(b) or b.startswith(a)
 
     def _warn_missing_replyer_hook(self) -> None:
         if self._arm_warning_emitted:
@@ -534,6 +571,36 @@ class ReplySplitter(MaiBotPlugin):
             "尚未观测到 maisaka.replyer.after_response，scope=replyer_only 下不会切分任何消息。"
             "若确认日志里始终没有该钩子，请把 splitter.scope 改成 all"
         )
+
+    def _log_hook_payload(self, tag: str, payload: dict[str, Any]) -> None:
+        """诊断用：打印某个钩子的实参键、形状与短文本原文。只读不改。
+
+        用途：确认钩子到底带了哪些字段——例如
+        `maisaka.replyer.after_response` 是否携带回复正文。这决定了
+        「按回复正文比对」的准入判据是否可行。由 [splitter]
+        diagnose_payload 开关控制，默认关闭，不影响正常切分。
+        """
+        if not payload:
+            self.ctx.logger.info("[诊断] %s 载荷为空（钩子未带任何实参）", tag)
+            return
+        self.ctx.logger.info("[诊断] %s keys=%s", tag, sorted(payload.keys()))
+        shape: dict[str, str] = {}
+        for key, value in payload.items():
+            if isinstance(value, str):
+                shape[key] = f"str[{len(value)}]"
+            elif isinstance(value, (dict, list, tuple)):
+                shape[key] = f"{type(value).__name__}[{len(value)}]"
+            else:
+                shape[key] = type(value).__name__
+        self.ctx.logger.info("[诊断] %s 字段形状=%s", tag, shape)
+        for key, value in payload.items():
+            # 短字符串直接打原文：正文若在里面，一眼就能看到，不必再去翻 JSON
+            if isinstance(value, str) and 0 < len(value) <= 120:
+                self.ctx.logger.info("[诊断] %s %s=%r", tag, key, value)
+            elif isinstance(value, dict) and value:
+                self.ctx.logger.info(
+                    "[诊断] %s %s 子键=%s", tag, key, sorted(value.keys())
+                )
 
     # 正文定位与回填
 
@@ -612,18 +679,40 @@ class ReplySplitter(MaiBotPlugin):
     @classmethod
     def _verify_sent(cls, message: Any, payload_keys: dict[str, Any],
                      expected_first: str, full_text: str) -> tuple[str, str]:
-        """在实发载荷里找出正文，判定它是首段还是全文。返回 (verdict, 实发样本)。"""
+        """在实发载荷里找出正文，判定它是首段还是全文。返回 (verdict, 实发样本)。
+
+        v1.2.2：聚合口径由「先到先得」改为**全文优先（保守）**。
+
+        旧实现里只要任一候选被判 ok 就立即返回 ok，即便另一候选正是全文。
+        真机 2026-10-26 实录：hybrid 出站载荷同时含「被就地改写的首段」
+        （processed_plain_text）与「未改写的全文」（segments[].content），
+        循环先命中首段 → 判 ok → 放行补发；而宿主实际发的是全文，
+        于是同一条动态在群里出现两遍（第 1 条完整 + 其后 9 段重复）。
+
+        现口径：
+          - 任一候选**精确等于全文** → failed（宿主发的就是原文，补发必然重复）；
+          - 否则任一候选匹配首段 → ok；
+          - 都不匹配 → unknown（不补发）。
+        「比全文更长」的候选不直接判 failed —— 载荷里可能混入与正文无关的
+        长字符串（prompt、整段 JSON），按长度判 failed 会让切分永久失效。
+        """
         candidates = _collect_strings(message, [])
         candidates.extend(_collect_strings(payload_keys, []))
         sample = max(candidates, key=len) if candidates else ""
-        verdict = "unknown"
+        norm_full = cls._normalize_for_compare(full_text)
+        norm_first = cls._normalize_for_compare(expected_first)
+        saw_ok = False
         for candidate in candidates:
-            current = cls._classify_sent_text(candidate, expected_first, full_text)
-            if current == "ok":
-                return "ok", sample
-            if current == "failed":
-                verdict = "failed"
-        return verdict, sample
+            sent = cls._normalize_for_compare(candidate)
+            if not sent:
+                continue
+            if sent == norm_full:
+                return "failed", sample
+            if sent == norm_first or (
+                len(sent) < len(norm_full) and norm_full.startswith(sent)
+            ):
+                saw_ok = True
+        return ("ok" if saw_ok else "unknown"), sample
 
     # 补发
 
@@ -851,6 +940,27 @@ class ReplySplitter(MaiBotPlugin):
             )
             return {"action": "continue"}
 
+        # v1.2.4：正文比对。arm 时已记下 replyer 产出的回复正文，
+        # 出站内容与它对不上 → 不是这条回复，多半是同窗口内别的插件在推送
+        # （真机 2026-10-26：B 站动态推送被切成 10 段刷屏）。
+        # scope=all 是用户显式要求切所有出站，不做此判定。
+        if scope != "all":
+            expected = self._armed_text.get(stream_id, "")
+            if expected and not self._text_matches_reply(text, expected):
+                self.ctx.logger.info(
+                    "出站正文与 replyer 回复不一致，跳过切分（疑似插件推送）"
+                    "stream=%s src=%s 出站=%d字 期望=%d字 出站开头=%r",
+                    stream_id, src,
+                    len(self._normalize_for_compare(text)),
+                    len(expected),
+                    text[:40],
+                )
+                self._collect(
+                    {"event": "skip", "stream": stream_id,
+                     "reason": "not_replyer_text", "src": src, "text": text[:200]}
+                )
+                return {"action": "continue"}
+
         rid = uuid.uuid4().hex[:12]
         rules = self._build_rules()
         try:
@@ -981,9 +1091,14 @@ class ReplySplitter(MaiBotPlugin):
     )
     async def arm_replyer_reply(self, **kwargs: Any) -> dict[str, Any]:
         self._replyer_hook_seen = True
+        if self.config.splitter.diagnose_payload:
+            self._log_hook_payload("after_response", kwargs)
         stream_id = self._resolve_stream_id(kwargs, None)
         if stream_id:
-            self._arm_stream(stream_id)
+            # response 是本条回复的正文（真机 2026-10-28 实测存在，250 字），
+            # 交给 arm 做来源判定；拿不到时退化为纯时间窗。
+            response = kwargs.get("response")
+            self._arm_stream(stream_id, response if isinstance(response, str) else "")
         return {"action": "continue"}
 
     @HookHandler(

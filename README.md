@@ -184,7 +184,7 @@ send_service.after_send           ← 起后台任务，按顺序补发剩余段
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 是否启用规则切分 |
-| `scope` | `replyer_only` | `replyer_only` 只切回复模型产出的回复；`all` 切所有出站文本 |
+| `scope` | `replyer_only` | `replyer_only` 只切回复模型产出的回复；`all` 切所有出站文本。v1.2.4 起 `replyer_only` 会拿 `after_response.response` 与出站正文做比对，对不上的（插件推送等）一律放行不切 |
 | `min_length` | `60` | 短于该长度的回复不切分 |
 | `soft_max_length` | `180` | 单条目标长度 |
 | `hard_max_length` | `480` | 单条长度上限（仅含不可分割原子时才允许超出） |
@@ -197,7 +197,7 @@ send_service.after_send           ← 起后台任务，按顺序补发剩余段
 | `protect_kaomoji` | `true` | 保护颜文字 |
 | `typing` | `true` | 补发分段时沿用宿主的模拟打字等待 |
 | `wait_for_pending_ms` | `8000` | 新消息到达时最多等待同流补发完成多少毫秒 |
-| `diagnose_payload` | `false` | 打印出站载荷字段与正文预览，用于首次部署核对 |
+| `diagnose_payload` | `false` | 打印出站载荷字段与正文预览，用于首次部署核对；v1.2.3 起同时打印 `maisaka.replyer.after_response` 的实参形状（`[诊断] after_response keys=... 字段形状=...`），用于确认该钩子是否携带回复正文 |
 
 ### `[admin]`
 
@@ -403,7 +403,8 @@ manifest `capabilities` 声明：`send.text`
 
 | 现象 | 原因与处置 |
 |---|---|
-| **同一条回复的内容被讲了两遍**（先出全文，再出后半段） | 宿主没有采纳改写。日志会同时出现「未能就地改写宿主共享对象」与「实发校验未通过」。把 `splitter.diagnose_payload` 设为 `true`，回传日志里的 `含长文本的字段` 与实际样本长度，确定宿主到底读哪个字段后修正回填位置 |
+| **同一条回复的内容被讲了两遍**（先出全文，再出后半段） | 宿主没有采纳改写。日志会同时出现「未能就地改写宿主共享对象」与「实发校验未通过」。v1.2.2 起实发校验改为**全文优先**：任一候选精确等于全文即放弃补发，不再被「副本里的首段」抢先判 ok。若仍复现，把 `splitter.diagnose_payload` 设为 `true`，回传日志里的 `含长文本的字段` 与实际样本长度，确定宿主到底读哪个字段后修正回填位置 |
+| **插件推送被切成多段**（一条动态被拆成 10 条，每条一小段） | 已修（v1.2.4）。旧准入判据只有「聊天流 + 120 秒 arm 窗口」，不含发送方识别：replyer 刚回复过的窗口内，任何插件的 `send.*` 出站文本都会被当成回复切分。现 `after_response` 的 `response` 会记入 `_armed_text`，出站正文与之对不上（归一化相等或互为前缀才算匹配）即放行不切，日志出现「出站正文与 replyer 回复不一致，跳过切分（疑似插件推送）」。若仍复现，先确认该 Host 版本的 `after_response` 是否带 `response` 字段 |
 | 完全不切分，日志出现「尚未观测到 maisaka.replyer.after_response」 | 该 Host 版本的 replyer 钩子未派发。把 `splitter.scope` 改成 `all` 即可不依赖该标记 |
 | 回复被切了两次 | 宿主 `[response_splitter] enable` 没关 |
 | 日志出现「未能在出站载荷里定位正文，放弃切分」 | 该 Host 版本的出站载荷字段名不在预期列表内。把 `splitter.diagnose_payload` 设为 `true`，回传日志里的 `kwargs键` / `message键` |
